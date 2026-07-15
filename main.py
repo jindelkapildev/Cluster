@@ -11,53 +11,54 @@ if "audioop" not in sys.modules:
 import os
 import json
 import asyncio
+import logging
 import discord
 from discord import app_commands
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 from websockets.http import Headers
 from dotenv import load_dotenv
 
-# Load secret tokens from our secure .env file
+# Set up clean, standardized logging format
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("ClusterController")
+
+# Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Safely convert ADMIN_USER_ID to an integer
 try:
     ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", 0))
 except ValueError:
     ADMIN_USER_ID = 0
 
 SHARED_SECRET = os.getenv("SHARED_SECRET", "change_me_to_something_secure")
-
-# Render automatically provides a PORT environment variable.
-# If not present, it defaults to 8765.
 PORT = int(os.getenv("PORT", 8765))
 
 # Discord Bot Setup
 class ControlBot(discord.Client):
     def __init__(self):
-        # We need default intents. Presence, Members, and Message Content must be enabled in the developer portal.
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
 bot = ControlBot()
-
-# Registry to track live VPS connections
-# Key: worker_id (string), Value: websockets.WebSocketServerProtocol
 CONNECTED_WORKERS = {}
 
-# --- HEALTH CHECK FOR RENDER ---
-# Render Web Services require an HTTP response to verify the app is healthy.
-# This interceptor responds with "OK" to HTTP requests, while letting WebSockets pass through.
-async def health_check_handler(connection, path, request_headers):
+# --- FIXED HEALTH CHECK FOR RENDER (SILENT & CLEAN) ---
+async def health_check_handler(connection, request):
+    path = request.path
     if path == "/" or path == "/health":
-        # Return a standard HTTP 200 OK response
         headers = Headers([
             ("Content-Type", "text/plain"),
             ("Connection", "close")
         ])
+        # We process this quietly without spamming the main application logs
         return 200, headers, b"OK - Central Controller is Online"
     return None
 
@@ -65,69 +66,96 @@ async def health_check_handler(connection, path, request_headers):
 async def websocket_handler(websocket):
     worker_id = None
     try:
-        # 1. Wait for authentication handshake as the very first message
-        auth_payload_raw = await websocket.recv()
-        auth_data = json.loads(auth_payload_raw)
+        # 1. Wait for authentication handshake with a 10-second timeout to prevent lingering dead connections
+        auth_payload_raw = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+        
+        try:
+            auth_data = json.loads(auth_payload_raw)
+        except json.JSONDecodeError:
+            logger.warning("⚠️ [Security] Handshake rejected: Invalid JSON format sent.")
+            await websocket.close(1008, "Invalid JSON handshake")
+            return
         
         # Validate Secret Key
         if auth_data.get("secret") != SHARED_SECRET:
-            print("[Security] Blocked connection attempt: Invalid Secret Token.")
+            logger.warning("⚠️ [Security] Unauthorized connection attempt blocked (invalid secret token).")
             await websocket.close(1008, "Unauthorized")
             return
             
         worker_id = auth_data.get("worker_id")
         if not worker_id:
-            print("[Security] Blocked connection attempt: Missing worker_id.")
+            logger.warning("⚠️ [Security] Rejected connection: missing 'worker_id' parameter.")
             await websocket.close(1008, "Invalid worker_id")
             return
 
-        # Register connection
+        # Register the live connection
         CONNECTED_WORKERS[worker_id] = websocket
-        print(f"📡 [Connected] Worker '{worker_id}' is online and verified!")
+        logger.info(f"📡 [Connected] Worker '{worker_id}' is online and verified!")
         
-        # Keep connection open until the worker drops off
+        # Keep connection open until client closes it or disconnects
         await websocket.wait_closed()
         
+    except asyncio.TimeoutError:
+        logger.warning("⚠️ [Timeout] Incoming connection timed out during handshake.")
+        try:
+            await websocket.close(1008, "Handshake timeout")
+        except Exception:
+            pass
+    except (ConnectionClosedOK, ConnectionClosed):
+        # Graceful handling: client disconnected regularly
+        pass
     except Exception as e:
-        print(f"[Error] Connection error with worker '{worker_id}': {e}")
+        logger.error(f"❌ [Error] Unexpected websocket exception for '{worker_id or 'Unknown'}': {e}")
     finally:
-        # Clean up registration when connection is closed
+        # Guarantee clean-up when connection drops
         if worker_id and worker_id in CONNECTED_WORKERS:
             del CONNECTED_WORKERS[worker_id]
-            print(f"❌ [Disconnected] Worker '{worker_id}' went offline.")
+            logger.info(f"🔌 [Disconnected] Worker '{worker_id}' went offline.")
 
 # --- DISCORD SLASH COMMANDS ---
-
-# Helper function to forward commands to the specific VPS client
 async def send_vps_command(worker_id: str, command: str):
     if worker_id not in CONNECTED_WORKERS:
-        return {"status": "error", "message": f"VPS '{worker_id}' is offline."}
+        return {"status": "error", "message": f"VPS '{worker_id}' is currently offline."}
         
     websocket = CONNECTED_WORKERS[worker_id]
     payload = json.dumps({"command": command})
     
     try:
         await websocket.send(payload)
-        response_raw = await websocket.recv()
+        # Give the worker up to 30 seconds to reply (useful for long tasks like fetching deep logs)
+        response_raw = await asyncio.wait_for(websocket.recv(), timeout=30.0)
         return json.loads(response_raw)
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ [Timeout] Worker '{worker_id}' timed out responding to command: '{command}'")
+        return {"status": "error", "message": "Worker timed out trying to respond."}
+    except (ConnectionClosed, ConnectionClosedOK):
+        logger.warning(f"🔌 [Connection Lost] Connection to '{worker_id}' was terminated during command execution.")
+        return {"status": "error", "message": "Connection to worker was terminated."}
     except Exception as e:
+        logger.error(f"❌ [Error] Command delivery failed to '{worker_id}': {e}")
         return {"status": "error", "message": f"Communication failed: {e}"}
 
-# Autocomplete provider so Discord lists only currently active/online VPS connections
 async def vps_autocomplete(interaction: discord.Interaction, current: str):
+    # Ensure active socket cleanup during list rendering
+    dead_workers = []
+    for worker, ws in list(CONNECTED_WORKERS.items()):
+        if ws.closed:
+            dead_workers.append(worker)
+    for dw in dead_workers:
+        CONNECTED_WORKERS.pop(dw, None)
+        logger.info(f"🧹 [Auto-Clean] Removed stale socket client: '{dw}'")
+
     return [
         app_commands.Choice(name=worker, value=worker)
         for worker in CONNECTED_WORKERS.keys()
         if current.lower() in worker.lower()
     ]
 
-# 1. TEST COMMAND: Ping
 @bot.tree.command(name="ping", description="Test if the central bot is alive and responding")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"🏓 **Pong!** Bot is online. Latency: `{latency}ms`", ephemeral=True)
 
-# 2. TEST COMMAND: List Connected Workers
 @bot.tree.command(name="list-nodes", description="Show all currently connected VPS worker nodes")
 async def list_nodes(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_USER_ID:
@@ -141,7 +169,6 @@ async def list_nodes(interaction: discord.Interaction):
     active_nodes = "\n".join([f"• `{worker}` (Connected)" for worker in CONNECTED_WORKERS.keys()])
     await interaction.response.send_message(f"📡 **Active Database Workers ({len(CONNECTED_WORKERS)}):**\n{active_nodes}", ephemeral=True)
 
-# 3. CONTROLLER COMMAND: Manage Services
 @bot.tree.command(name="vps", description="Issue clean, start, stop, or log actions to your active instances")
 @app_commands.autocomplete(vps_id=vps_autocomplete)
 @app_commands.choices(action=[
@@ -151,21 +178,16 @@ async def list_nodes(interaction: discord.Interaction):
     app_commands.Choice(name="Fetch Logs", value="logs")
 ])
 async def vps_control(interaction: discord.Interaction, vps_id: str, action: app_commands.Choice[str]):
-    # Security Validation: Only the designated Admin User can command these nodes
     if interaction.user.id != ADMIN_USER_ID:
         await interaction.response.send_message("❌ Access Denied: You do not have permissions to manage these servers.", ephemeral=True)
         return
 
-    # Acknowledge command and keep the connection alive (gives worker time to respond)
     await interaction.response.defer()
-
-    # Dispatch to the specific websocket
     result = await send_vps_command(vps_id, action.value)
     
     if result.get("status") == "success":
         if action.value == "logs":
             log_output = result.get("output", "No logs present.")
-            # Format and send long log outputs inside code blocks safely
             escaped_backticks = "```"
             await interaction.followup.send(f"📄 **Logs for {vps_id}:**\n{escaped_backticks}\n{log_output[:1900]}\n{escaped_backticks}")
         else:
@@ -175,31 +197,27 @@ async def vps_control(interaction: discord.Interaction, vps_id: str, action: app
 
 @bot.event
 async def on_ready():
-    print(f"🤖 Connected to Discord as {bot.user} (ID: {bot.user.id})")
+    logger.info(f"🤖 Connected to Discord as {bot.user} (ID: {bot.user.id})")
     try:
-        # Sync slash commands globally
         synced = await bot.tree.sync()
-        print(f"✨ Successfully synced {len(synced)} slash commands.")
+        logger.info(f"✨ Successfully synced {len(synced)} slash commands.")
     except Exception as e:
-        print(f"⚠️ Slash command synchronization failed: {e}")
+        logger.error(f"⚠️ Slash command synchronization failed: {e}")
 
 # --- SYSTEM INITIALIZATION ---
 async def main():
     if not DISCORD_TOKEN or not ADMIN_USER_ID:
-        print("❌ Configuration Missing! Please configure your environment variables with your Discord token and Admin ID.")
+        logger.error("❌ Configuration Missing! Please configure your environment variables.")
         return
 
-    # Fire up the inbound WebSocket server on Render's designated PORT
-    # Incorporates the HTTP health_check_handler to satisfy Render's web portal checks
     async with websockets.serve(
         websocket_handler, 
         "0.0.0.0", 
         PORT, 
         process_request=health_check_handler
     ):
-        print(f"🔒 Secure Node Controller listening on port {PORT}...")
+        logger.info(f"🔒 Secure Node Controller listening on port {PORT}...")
         
-        # Run Discord Client alongside websocket task loops
         async with bot:
             await bot.start(DISCORD_TOKEN)
 
@@ -207,4 +225,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopping Controller gracefully.")
+        logger.info("Stopping Controller gracefully.")

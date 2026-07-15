@@ -4,6 +4,7 @@ import asyncio
 import discord
 from discord import app_commands
 import websockets
+from websockets.http import Headers
 from dotenv import load_dotenv
 
 # Load secret tokens from our secure .env file
@@ -36,6 +37,19 @@ bot = ControlBot()
 # Registry to track live VPS connections
 # Key: worker_id (string), Value: websockets.WebSocketServerProtocol
 CONNECTED_WORKERS = {}
+
+# --- HEALTH CHECK FOR RENDER ---
+# Render Web Services require an HTTP response to verify the app is healthy.
+# This interceptor responds with "OK" to HTTP requests, while letting WebSockets pass through.
+async def health_check_handler(connection, path, request_headers):
+    if path == "/" or path == "/health":
+        # Return a standard HTTP 200 OK response
+        headers = Headers([
+            ("Content-Type", "text/plain"),
+            ("Connection", "close")
+        ])
+        return 200, headers, b"OK - Central Controller is Online"
+    return None
 
 # --- WEBSOCKET SERVER LOGIC ---
 async def websocket_handler(websocket):
@@ -97,6 +111,27 @@ async def vps_autocomplete(interaction: discord.Interaction, current: str):
         if current.lower() in worker.lower()
     ]
 
+# 1. TEST COMMAND: Ping
+@bot.tree.command(name="ping", description="Test if the central bot is alive and responding")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 **Pong!** Bot is online. Latency: `{latency}ms`", ephemeral=True)
+
+# 2. TEST COMMAND: List Connected Workers
+@bot.tree.command(name="list-nodes", description="Show all currently connected VPS worker nodes")
+async def list_nodes(interaction: discord.Interaction):
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message("❌ Access Denied.", ephemeral=True)
+        return
+
+    if not CONNECTED_WORKERS:
+        await interaction.response.send_message("📡 No workers are currently connected to the controller.", ephemeral=True)
+        return
+
+    active_nodes = "\n".join([f"• `{worker}` (Connected)" for worker in CONNECTED_WORKERS.keys()])
+    await interaction.response.send_message(f"📡 **Active Database Workers ({len(CONNECTED_WORKERS)}):**\n{active_nodes}", ephemeral=True)
+
+# 3. CONTROLLER COMMAND: Manage Services
 @bot.tree.command(name="vps", description="Issue clean, start, stop, or log actions to your active instances")
 @app_commands.autocomplete(vps_id=vps_autocomplete)
 @app_commands.choices(action=[
@@ -121,7 +156,6 @@ async def vps_control(interaction: discord.Interaction, vps_id: str, action: app
         if action.value == "logs":
             log_output = result.get("output", "No logs present.")
             # Format and send long log outputs inside code blocks safely
-            # Note: We escape backticks using python formatting to prevent premature file truncation
             escaped_backticks = "```"
             await interaction.followup.send(f"📄 **Logs for {vps_id}:**\n{escaped_backticks}\n{log_output[:1900]}\n{escaped_backticks}")
         else:
@@ -146,7 +180,13 @@ async def main():
         return
 
     # Fire up the inbound WebSocket server on Render's designated PORT
-    async with websockets.serve(websocket_handler, "0.0.0.0", PORT):
+    # Incorporates the HTTP health_check_handler to satisfy Render's web portal checks
+    async with websockets.serve(
+        websocket_handler, 
+        "0.0.0.0", 
+        PORT, 
+        process_request=health_check_handler
+    ):
         print(f"🔒 Secure Node Controller listening on port {PORT}...")
         
         # Run Discord Client alongside websocket task loops

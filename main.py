@@ -1,3 +1,13 @@
+import sys
+from types import ModuleType
+
+# --- PYTHON 3.13+ COMPATIBILITY PATCH ---
+# Modern Python versions (3.13, 3.14) removed the 'audioop' module, causing discord.py to crash on import.
+# Since this bot only handles text/slash commands and doesn't use audio/voice channels,
+# we securely mock 'audioop' at runtime before importing discord.
+if "audioop" not in sys.modules:
+    sys.modules["audioop"] = ModuleType("audioop")
+
 import os
 import json
 import asyncio

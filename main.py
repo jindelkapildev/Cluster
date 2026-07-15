@@ -50,15 +50,15 @@ class ControlBot(discord.Client):
 bot = ControlBot()
 CONNECTED_WORKERS = {}
 
-# --- FIXED HEALTH CHECK FOR RENDER (SILENT & CLEAN) ---
-async def health_check_handler(connection, request):
-    path = request.path
+# --- CORRECTED HEALTH CHECK FOR RENDER ---
+# websockets.serve expects the process_request hook to accept (path, request_headers)
+async def health_check_handler(path, request_headers):
     if path == "/" or path == "/health":
         headers = Headers([
             ("Content-Type", "text/plain"),
             ("Connection", "close")
         ])
-        # We process this quietly without spamming the main application logs
+        # Return HTTP 200 OK directly to Render's health checker
         return 200, headers, b"OK - Central Controller is Online"
     return None
 
@@ -66,7 +66,7 @@ async def health_check_handler(connection, request):
 async def websocket_handler(websocket):
     worker_id = None
     try:
-        # 1. Wait for authentication handshake with a 10-second timeout to prevent lingering dead connections
+        # Wait for authentication handshake with a 10-second timeout
         auth_payload_raw = await asyncio.wait_for(websocket.recv(), timeout=10.0)
         
         try:
@@ -78,21 +78,20 @@ async def websocket_handler(websocket):
         
         # Validate Secret Key
         if auth_data.get("secret") != SHARED_SECRET:
-            logger.warning("⚠️ [Security] Unauthorized connection attempt blocked (invalid secret token).")
+            logger.warning("⚠️ [Security] Unauthorized connection attempt blocked.")
             await websocket.close(1008, "Unauthorized")
             return
             
         worker_id = auth_data.get("worker_id")
         if not worker_id:
-            logger.warning("⚠️ [Security] Rejected connection: missing 'worker_id' parameter.")
+            logger.warning("⚠️ [Security] Rejected connection: missing 'worker_id'.")
             await websocket.close(1008, "Invalid worker_id")
             return
 
-        # Register the live connection
         CONNECTED_WORKERS[worker_id] = websocket
         logger.info(f"📡 [Connected] Worker '{worker_id}' is online and verified!")
         
-        # Keep connection open until client closes it or disconnects
+        # Keep connection open until client closes it
         await websocket.wait_closed()
         
     except asyncio.TimeoutError:
@@ -102,12 +101,10 @@ async def websocket_handler(websocket):
         except Exception:
             pass
     except (ConnectionClosedOK, ConnectionClosed):
-        # Graceful handling: client disconnected regularly
         pass
     except Exception as e:
         logger.error(f"❌ [Error] Unexpected websocket exception for '{worker_id or 'Unknown'}': {e}")
     finally:
-        # Guarantee clean-up when connection drops
         if worker_id and worker_id in CONNECTED_WORKERS:
             del CONNECTED_WORKERS[worker_id]
             logger.info(f"🔌 [Disconnected] Worker '{worker_id}' went offline.")
@@ -122,21 +119,19 @@ async def send_vps_command(worker_id: str, command: str):
     
     try:
         await websocket.send(payload)
-        # Give the worker up to 30 seconds to reply (useful for long tasks like fetching deep logs)
         response_raw = await asyncio.wait_for(websocket.recv(), timeout=30.0)
         return json.loads(response_raw)
     except asyncio.TimeoutError:
         logger.error(f"⏱️ [Timeout] Worker '{worker_id}' timed out responding to command: '{command}'")
         return {"status": "error", "message": "Worker timed out trying to respond."}
     except (ConnectionClosed, ConnectionClosedOK):
-        logger.warning(f"🔌 [Connection Lost] Connection to '{worker_id}' was terminated during command execution.")
+        logger.warning(f"🔌 [Connection Lost] Connection to '{worker_id}' was terminated.")
         return {"status": "error", "message": "Connection to worker was terminated."}
     except Exception as e:
         logger.error(f"❌ [Error] Command delivery failed to '{worker_id}': {e}")
         return {"status": "error", "message": f"Communication failed: {e}"}
 
 async def vps_autocomplete(interaction: discord.Interaction, current: str):
-    # Ensure active socket cleanup during list rendering
     dead_workers = []
     for worker, ws in list(CONNECTED_WORKERS.items()):
         if ws.closed:

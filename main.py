@@ -2,6 +2,9 @@ import sys
 from types import ModuleType
 
 # --- PYTHON 3.13+ COMPATIBILITY PATCH ---
+# Modern Python versions (3.13, 3.14) removed the 'audioop' module, causing discord.py to crash on import.
+# Since this bot only handles text/slash commands and doesn't use audio/voice channels,
+# we securely mock 'audioop' at runtime before importing discord.
 if "audioop" not in sys.modules:
     sys.modules["audioop"] = ModuleType("audioop")
 
@@ -23,6 +26,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("ClusterController")
+
+# Silence noisy connection handlers & protocol rejections (scans, health checks, etc.)
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
+logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
 
 # Load environment variables
 load_dotenv()
@@ -47,21 +54,155 @@ class ControlBot(discord.Client):
 bot = ControlBot()
 CONNECTED_WORKERS = {}
 
-# --- FIXED HEALTH CHECK FOR RENDER ---
-# Distinguishes between Render's HTTP health check and actual WebSocket upgrades.
+# --- FIXED HEALTH CHECK & WEBPAGE FOR RENDER ---
+# Serves a beautiful web console to browsers & keeps Render's health checkers happy.
 async def health_check_handler(path, request_headers):
-    # If the incoming request has the standard WebSocket upgrade headers,
-    # return None to let the connection proceed to the WebSocket server handshake!
+    # Let standard websocket upgrade handshakes pass cleanly straight to the WS handler
     if "upgrade" in request_headers and request_headers["upgrade"].lower() == "websocket":
         return None
     
-    # If it's a plain HTTP request (like Render pinging `/` or `/health`), return 200 OK
+    # Serve a modern, dark-themed HTML monitoring dashboard for standard HTTP requests
     if path == "/" or path == "/health":
+        # Build node elements dynamically from the active memory map
+        if CONNECTED_WORKERS:
+            node_items_html = ""
+            for name in sorted(CONNECTED_WORKERS.keys()):
+                node_items_html += f"""
+                <div class="node-item">
+                    <span class="node-name">⚙ {name}</span>
+                    <span class="node-status">ONLINE</span>
+                </div>
+                """
+        else:
+            node_items_html = '<div class="empty">No workers connected currently.</div>'
+
+        html_content = f"""<!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Cluster Control Console</title>
+            <style>
+                body {{
+                    background-color: #0d1117;
+                    color: #c9d1d9;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+                    margin: 0;
+                    padding: 0;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                }}
+                .card {{
+                    background: #161b22;
+                    border: 1px solid #30363d;
+                    border-radius: 12px;
+                    padding: 30px;
+                    max-width: 480px;
+                    width: 90%;
+                    box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+                    text-align: center;
+                }}
+                .status-badge {{
+                    display: inline-block;
+                    background: rgba(47, 190, 106, 0.15);
+                    color: #56d364;
+                    padding: 6px 14px;
+                    border-radius: 20px;
+                    font-weight: bold;
+                    font-size: 0.85em;
+                    margin-bottom: 20px;
+                    border: 1px solid rgba(47, 190, 106, 0.3);
+                    letter-spacing: 0.5px;
+                }}
+                h1 {{
+                    color: #ffffff;
+                    margin: 0 0 12px 0;
+                    font-size: 1.75em;
+                    font-weight: 600;
+                }}
+                p {{
+                    color: #8b949e;
+                    font-size: 0.95em;
+                    line-height: 1.6;
+                    margin: 0 0 24px 0;
+                }}
+                .node-list {{
+                    text-align: left;
+                    background: #0d1117;
+                    padding: 18px;
+                    border-radius: 8px;
+                    border: 1px solid #21262d;
+                }}
+                .node-title {{
+                    font-size: 0.8em;
+                    color: #8b949e;
+                    text-transform: uppercase;
+                    letter-spacing: 1px;
+                    margin-bottom: 12px;
+                    font-weight: bold;
+                    border-bottom: 1px solid #21262d;
+                    padding-bottom: 6px;
+                }}
+                .node-item {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 8px 0;
+                    border-bottom: 1px solid #161b22;
+                }}
+                .node-item:last-child {{
+                    border-bottom: none;
+                }}
+                .node-name {{
+                    color: #58a6ff;
+                    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+                    font-size: 0.9em;
+                }}
+                .node-status {{
+                    color: #56d364;
+                    font-size: 0.85em;
+                    font-weight: bold;
+                }}
+                .empty {{
+                    color: #8b949e;
+                    font-style: italic;
+                    text-align: center;
+                    font-size: 0.9em;
+                    padding: 12px 0;
+                }}
+                .footer {{
+                    margin-top: 25px;
+                    font-size: 0.8em;
+                    color: #484f58;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="status-badge">● CONTROL CENTER ONLINE</div>
+                <h1>Cluster Control Console</h1>
+                <p>Secure centralized orchestrator for database workers and automated systems.</p>
+                
+                <div class="node-list">
+                    <div class="node-title">Active VPS Instances ({len(CONNECTED_WORKERS)})</div>
+                    {node_items_html}
+                </div>
+                
+                <div class="footer">
+                    Central Controller Bot v2.2 • SSL Encryption Active
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
         headers = Headers([
-            ("Content-Type", "text/plain"),
+            ("Content-Type", "text/html"),
             ("Connection", "close")
         ])
-        return 200, headers, b"OK - Central Controller is Online"
+        return 200, headers, html_content.encode("utf-8")
     
     return None
 
@@ -212,7 +353,9 @@ async def main():
         websocket_handler, 
         "0.0.0.0", 
         PORT, 
-        process_request=health_check_handler
+        process_request=health_check_handler,
+        ping_interval=20,
+        ping_timeout=20
     ):
         logger.info(f"🔒 Secure Node Controller listening on port {PORT}...")
         

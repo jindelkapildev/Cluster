@@ -2,9 +2,6 @@ import sys
 from types import ModuleType
 
 # --- PYTHON 3.13+ COMPATIBILITY PATCH ---
-# Modern Python versions (3.13, 3.14) removed the 'audioop' module, causing discord.py to crash on import.
-# Since this bot only handles text/slash commands and doesn't use audio/voice channels,
-# we securely mock 'audioop' at runtime before importing discord.
 if "audioop" not in sys.modules:
     sys.modules["audioop"] = ModuleType("audioop")
 
@@ -50,16 +47,22 @@ class ControlBot(discord.Client):
 bot = ControlBot()
 CONNECTED_WORKERS = {}
 
-# --- CORRECTED HEALTH CHECK FOR RENDER ---
-# websockets.serve expects the process_request hook to accept (path, request_headers)
+# --- FIXED HEALTH CHECK FOR RENDER ---
+# Distinguishes between Render's HTTP health check and actual WebSocket upgrades.
 async def health_check_handler(path, request_headers):
+    # If the incoming request has the standard WebSocket upgrade headers,
+    # return None to let the connection proceed to the WebSocket server handshake!
+    if "upgrade" in request_headers and request_headers["upgrade"].lower() == "websocket":
+        return None
+    
+    # If it's a plain HTTP request (like Render pinging `/` or `/health`), return 200 OK
     if path == "/" or path == "/health":
         headers = Headers([
             ("Content-Type", "text/plain"),
             ("Connection", "close")
         ])
-        # Return HTTP 200 OK directly to Render's health checker
         return 200, headers, b"OK - Central Controller is Online"
+    
     return None
 
 # --- WEBSOCKET SERVER LOGIC ---

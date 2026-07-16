@@ -300,10 +300,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        async with asyncio.Runner() if sys.version_info >= (3, 11) else None as runner:
-            if runner:
-                runner.run(main())
-            else:
-                asyncio.run(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Stopping Controller gracefully.")

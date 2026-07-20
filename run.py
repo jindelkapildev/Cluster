@@ -1,6 +1,5 @@
 import sys
 from types import ModuleType
-from page import run_web_server
 
 # --- PYTHON 3.13+ COMPATIBILITY PATCH ---
 # Modern Python versions (3.13, 3.14) removed the 'audioop' module, causing discord.py to crash on import.
@@ -285,9 +284,6 @@ async def main():
     if not DISCORD_TOKEN or not ADMIN_USER_ID:
         logger.error("❌ Configuration Missing! Please configure your environment variables.")
         return
-    # START THE WEB SERVER HERE
-    print("[System] Launching web dashboard server...")
-    bot.loop.create_task(run_web_server())
 
     async with websockets.serve(
         websocket_handler, 

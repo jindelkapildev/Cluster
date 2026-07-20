@@ -18,7 +18,7 @@ PORT = int(os.getenv("PORT", 8765))
 async def health_check_handler(path, request_headers):
     """
     Handles HTTP GET & HEAD requests from UptimeRobot / Render health checks,
-    preventing HTTP 400 Bad Request errors.
+    preventing HTTP 400 Bad Request errors and crashes.
     """
     # 1. Allow actual WebSocket handshake upgrade requests to pass through
     if "upgrade" in request_headers and request_headers["upgrade"].lower() == "websocket":
@@ -26,12 +26,6 @@ async def health_check_handler(path, request_headers):
 
     # 2. Respond to UptimeRobot HTTP requests (GET and HEAD)
     if path in ["/", "/health", ""]:
-        headers = Headers([
-            ("Content-Type", "text/html; charset=utf-8"),
-            ("Connection", "close")
-        ])
-
-        # Render HTML page for GET, or empty body for HEAD requests
         if CONNECTED_WORKERS:
             node_items_html = "".join([
                 f'<div class="node-item"><span class="node-name">⚙ {name}</span><span class="node-status">ONLINE</span></div>'
@@ -67,7 +61,14 @@ async def health_check_handler(path, request_headers):
         </html>"""
 
         body_bytes = html_content.encode("utf-8")
-        headers.append(("Content-Length", str(len(body_bytes))))
+
+        # Pass all headers directly into Headers construction
+        headers = Headers([
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Content-Length", str(len(body_bytes))),
+            ("Connection", "close")
+        ])
+
         return 200, headers, body_bytes
 
     return 404, Headers([("Connection", "close")]), b"404 Not Found"
